@@ -1,13 +1,24 @@
 require("dotenv").config();
 const express = require("express");
-const mongoose = require("mongoose");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const multer = require("multer");
 const path = require("path");
 const cors = require("cors");
+const mysql = require("mysql2/promise");
 
 const app = express();
+
+// --- MySQL pool ---
+const pool = mysql.createPool({
+    host: process.env.DB_HOST,
+    port: process.env.DB_PORT || 3306,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    waitForConnections: true,
+    connectionLimit: 10,
+});
 
 // --- Middleware-ek ---
 app.use(cors());
@@ -27,54 +38,11 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// --- MongoDB csatlakozás ---
-mongoose
-    .connect(process.env.MONGODB_URI, {
-        useNewUrlParser: true,
-        useUnifiedTopology: true,
-    })
-    .then(() => console.log("MongoDB connected"))
-    .catch((err) => console.error("MongoDB error:", err));
-
-// --- Mongoose sémák / modellek ---
-
-const userSchema = new mongoose.Schema(
-    {
-        username: { type: String, required: true, unique: true },
-        email: { type: String, required: true, unique: true },
-        passwordHash: { type: String, required: true },
-    },
-    { timestamps: true }
-);
-
-const photoSchema = new mongoose.Schema(
-    {
-        owner: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
-        url: { type: String, required: true },
-        caption: { type: String },
-        likes: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
-    },
-    { timestamps: true }
-);
-
-const commentSchema = new mongoose.Schema(
-    {
-        photo: { type: mongoose.Schema.Types.ObjectId, ref: "Photo", required: true },
-        author: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
-        text: { type: String, required: true },
-    },
-    { timestamps: true }
-);
-
-const User = mongoose.model("User", userSchema);
-const Photo = mongoose.model("Photo", photoSchema);
-const Comment = mongoose.model("Comment", commentSchema);
-
 // --- Auth middleware ---
-
 function authRequired(req, res, next) {
     const authHeader = req.headers.authorization;
-    if (!authHeader) return res.status(401).json({ error: "Hiányzó Authorization header" });
+    if (!authHeader)
+        return res.status(401).json({ error: "Hiányzó Authorization header" });
 
     const token = authHeader.split(" ")[1];
     if (!token) return res.status(401).json({ error: "Hiányzó token" });
@@ -94,21 +62,34 @@ app.post("/auth/register", async (req, res) => {
         const { username, email, password } = req.body;
 
         if (!username || !email || !password)
-            return res.status(400).json({ error: "username, email, password kötelező" });
+            return res
+                .status(400)
+                .json({ error: "username, email, password kötelező" });
 
-        const existingUser = await User.findOne({ $or: [{ email }, { username }] });
-        if (existingUser) {
-            return res.status(409).json({ error: "A felhasználó már létezik (email vagy username foglalt)" });
+        const [existing] = await pool.query(
+            "SELECT id FROM users WHERE email = ? OR username = ?",
+            [email, username]
+        );
+        if (existing.length > 0) {
+            return res
+                .status(409)
+                .json({ error: "A felhasználó már létezik (email vagy username foglalt)" });
         }
 
         const passwordHash = await bcrypt.hash(password, 10);
-        const user = await User.create({ username, email, passwordHash });
+
+        const [result] = await pool.query(
+            "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
+            [username, email, passwordHash]
+        );
+
+        const userId = result.insertId;
 
         res.status(201).json({
-            id: user._id,
-            username: user.username,
-            email: user.email,
-            createdAt: user.createdAt,
+            id: userId,
+            username,
+            email,
+            createdAt: new Date(), // egyszerűen mostani idő
         });
     } catch (err) {
         console.error("Register error:", err);
@@ -122,25 +103,31 @@ app.post("/auth/login", async (req, res) => {
         const { emailOrUsername, password } = req.body;
 
         if (!emailOrUsername || !password)
-            return res.status(400).json({ error: "emailOrUsername és password kötelező" });
+            return res
+                .status(400)
+                .json({ error: "emailOrUsername és password kötelező" });
 
-        const user = await User.findOne({
-            $or: [{ email: emailOrUsername }, { username: emailOrUsername }],
-        });
+        const [rows] = await pool.query(
+            "SELECT id, username, email, password_hash FROM users WHERE email = ? OR username = ? LIMIT 1",
+            [emailOrUsername, emailOrUsername]
+        );
 
-        if (!user) return res.status(401).json({ error: "Hibás belépési adatok" });
+        if (rows.length === 0)
+            return res.status(401).json({ error: "Hibás belépési adatok" });
 
-        const ok = await bcrypt.compare(password, user.passwordHash);
+        const user = rows[0];
+
+        const ok = await bcrypt.compare(password, user.password_hash);
         if (!ok) return res.status(401).json({ error: "Hibás belépési adatok" });
 
-        const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, {
+        const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, {
             expiresIn: "7d",
         });
 
         res.json({
             token,
             user: {
-                id: user._id,
+                id: user.id,
                 username: user.username,
                 email: user.email,
             },
@@ -156,18 +143,25 @@ app.post("/auth/login", async (req, res) => {
 // Fotó feltöltése (auth + fájl)
 app.post("/photos", authRequired, upload.single("image"), async (req, res) => {
     try {
-        if (!req.file) return res.status(400).json({ error: "Hiányzó image fájl" });
+        if (!req.file)
+            return res.status(400).json({ error: "Hiányzó image fájl" });
 
         const { caption } = req.body;
-        const fileUrl = `/uploads/${req.file.filename}`; // publikus URL
+        const fileUrl = `/uploads/${req.file.filename}`;
 
-        const photo = await Photo.create({
-            owner: req.userId,
-            url: fileUrl,
-            caption,
-        });
+        const [result] = await pool.query(
+            "INSERT INTO photos (owner_id, url, caption) VALUES (?, ?, ?)",
+            [req.userId, fileUrl, caption || null]
+        );
 
-        res.status(201).json(photo);
+        const photoId = result.insertId;
+
+        const [rows] = await pool.query(
+            "SELECT id, owner_id AS ownerId, url, caption, created_at AS createdAt FROM photos WHERE id = ?",
+            [photoId]
+        );
+
+        res.status(201).json(rows[0]);
     } catch (err) {
         console.error("Upload photo error:", err);
         res.status(500).json({ error: "Szerver hiba" });
@@ -179,16 +173,29 @@ app.get("/photos", async (req, res) => {
     try {
         const page = parseInt(req.query.page || "1", 10);
         const limit = parseInt(req.query.limit || "10", 10);
-        const skip = (page - 1) * limit;
+        const offset = (page - 1) * limit;
 
-        const [items, total] = await Promise.all([
-            Photo.find({})
-                .populate("owner", "username email")
-                .sort({ createdAt: -1 })
-                .skip(skip)
-                .limit(limit),
-            Photo.countDocuments(),
-        ]);
+        const [items] = await pool.query(
+            `SELECT 
+         p.id,
+         p.url,
+         p.caption,
+         p.created_at AS createdAt,
+         u.id AS ownerId,
+         u.username AS ownerUsername,
+         u.email AS ownerEmail,
+         (SELECT COUNT(*) FROM photo_likes pl WHERE pl.photo_id = p.id) AS likesCount
+       FROM photos p
+       JOIN users u ON u.id = p.owner_id
+       ORDER BY p.created_at DESC
+       LIMIT ? OFFSET ?`,
+            [limit, offset]
+        );
+
+        const [countRows] = await pool.query(
+            "SELECT COUNT(*) AS total FROM photos"
+        );
+        const total = countRows[0].total;
 
         res.json({
             page,
@@ -205,9 +212,27 @@ app.get("/photos", async (req, res) => {
 // Egy fotó lekérése
 app.get("/photos/:id", async (req, res) => {
     try {
-        const photo = await Photo.findById(req.params.id).populate("owner", "username email");
-        if (!photo) return res.status(404).json({ error: "Fotó nem található" });
-        res.json(photo);
+        const photoId = req.params.id;
+
+        const [rows] = await pool.query(
+            `SELECT 
+         p.id,
+         p.url,
+         p.caption,
+         p.created_at AS createdAt,
+         u.id AS ownerId,
+         u.username AS ownerUsername,
+         u.email AS ownerEmail
+       FROM photos p
+       JOIN users u ON u.id = p.owner_id
+       WHERE p.id = ?`,
+            [photoId]
+        );
+
+        if (rows.length === 0)
+            return res.status(404).json({ error: "Fotó nem található" });
+
+        res.json(rows[0]);
     } catch (err) {
         console.error("Get photo error:", err);
         res.status(500).json({ error: "Szerver hiba" });
@@ -217,18 +242,28 @@ app.get("/photos/:id", async (req, res) => {
 // Fotó like-olása
 app.post("/photos/:id/like", authRequired, async (req, res) => {
     try {
-        const photo = await Photo.findById(req.params.id);
-        if (!photo) return res.status(404).json({ error: "Fotó nem található" });
+        const photoId = req.params.id;
 
-        const hasLiked = photo.likes.some(
-            (userId) => userId.toString() === req.userId
+        // Ellenőrizzük, hogy létezik-e a fotó
+        const [photoRows] = await pool.query(
+            "SELECT id FROM photos WHERE id = ?",
+            [photoId]
         );
-        if (!hasLiked) {
-            photo.likes.push(req.userId);
-            await photo.save();
-        }
+        if (photoRows.length === 0)
+            return res.status(404).json({ error: "Fotó nem található" });
 
-        res.json({ likesCount: photo.likes.length });
+        // INSERT IGNORE -> ha már létezik (unique (photo_id,user_id)), nem dob hibát
+        await pool.query(
+            "INSERT IGNORE INTO photo_likes (photo_id, user_id) VALUES (?, ?)",
+            [photoId, req.userId]
+        );
+
+        const [countRows] = await pool.query(
+            "SELECT COUNT(*) AS likesCount FROM photo_likes WHERE photo_id = ?",
+            [photoId]
+        );
+
+        res.json({ likesCount: countRows[0].likesCount });
     } catch (err) {
         console.error("Like photo error:", err);
         res.status(500).json({ error: "Szerver hiba" });
@@ -238,15 +273,19 @@ app.post("/photos/:id/like", authRequired, async (req, res) => {
 // Fotó unlike-olása
 app.delete("/photos/:id/like", authRequired, async (req, res) => {
     try {
-        const photo = await Photo.findById(req.params.id);
-        if (!photo) return res.status(404).json({ error: "Fotó nem található" });
+        const photoId = req.params.id;
 
-        photo.likes = photo.likes.filter(
-            (userId) => userId.toString() !== req.userId
+        await pool.query(
+            "DELETE FROM photo_likes WHERE photo_id = ? AND user_id = ?",
+            [photoId, req.userId]
         );
-        await photo.save();
 
-        res.json({ likesCount: photo.likes.length });
+        const [countRows] = await pool.query(
+            "SELECT COUNT(*) AS likesCount FROM photo_likes WHERE photo_id = ?",
+            [photoId]
+        );
+
+        res.json({ likesCount: countRows[0].likesCount });
     } catch (err) {
         console.error("Unlike photo error:", err);
         res.status(500).json({ error: "Szerver hiba" });
@@ -258,19 +297,40 @@ app.delete("/photos/:id/like", authRequired, async (req, res) => {
 // Komment létrehozása egy fotóhoz
 app.post("/photos/:id/comments", authRequired, async (req, res) => {
     try {
+        const photoId = req.params.id;
         const { text } = req.body;
+
         if (!text) return res.status(400).json({ error: "text kötelező" });
 
-        const photo = await Photo.findById(req.params.id);
-        if (!photo) return res.status(404).json({ error: "Fotó nem található" });
+        const [photoRows] = await pool.query(
+            "SELECT id FROM photos WHERE id = ?",
+            [photoId]
+        );
+        if (photoRows.length === 0)
+            return res.status(404).json({ error: "Fotó nem található" });
 
-        const comment = await Comment.create({
-            photo: photo._id,
-            author: req.userId,
-            text,
-        });
+        const [result] = await pool.query(
+            "INSERT INTO comments (photo_id, author_id, text) VALUES (?, ?, ?)",
+            [photoId, req.userId, text]
+        );
 
-        res.status(201).json(comment);
+        const commentId = result.insertId;
+
+        const [rows] = await pool.query(
+            `SELECT 
+         c.id,
+         c.text,
+         c.created_at AS createdAt,
+         u.id AS authorId,
+         u.username AS authorUsername,
+         u.email AS authorEmail
+       FROM comments c
+       JOIN users u ON u.id = c.author_id
+       WHERE c.id = ?`,
+            [commentId]
+        );
+
+        res.status(201).json(rows[0]);
     } catch (err) {
         console.error("Create comment error:", err);
         res.status(500).json({ error: "Szerver hiba" });
@@ -280,11 +340,24 @@ app.post("/photos/:id/comments", authRequired, async (req, res) => {
 // Kommentek listázása egy fotóhoz
 app.get("/photos/:id/comments", async (req, res) => {
     try {
-        const comments = await Comment.find({ photo: req.params.id })
-            .populate("author", "username email")
-            .sort({ createdAt: 1 });
+        const photoId = req.params.id;
 
-        res.json(comments);
+        const [rows] = await pool.query(
+            `SELECT 
+         c.id,
+         c.text,
+         c.created_at AS createdAt,
+         u.id AS authorId,
+         u.username AS authorUsername,
+         u.email AS authorEmail
+       FROM comments c
+       JOIN users u ON u.id = c.author_id
+       WHERE c.photo_id = ?
+       ORDER BY c.created_at ASC`,
+            [photoId]
+        );
+
+        res.json(rows);
     } catch (err) {
         console.error("List comments error:", err);
         res.status(500).json({ error: "Szerver hiba" });
@@ -293,7 +366,7 @@ app.get("/photos/:id/comments", async (req, res) => {
 
 // --- Health check ---
 app.get("/", (req, res) => {
-    res.json({ status: "ok", message: "Photoshare API fut" });
+    res.json({ status: "ok", message: "Photoshare API (MySQL) fut" });
 });
 
 // --- Szerver indítása ---
